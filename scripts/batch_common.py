@@ -66,6 +66,38 @@ def is_browser_crash_error(exc: Exception) -> bool:
     return any(marker in message for marker in markers)
 
 
+def is_network_error(exc: Exception) -> bool:
+    if hasattr(core, "is_network_error"):
+        return core.is_network_error(exc)
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "internet_disconnected",
+            "net::err",
+            "network",
+            "enotfound",
+            "econnrefused",
+            "offline",
+        )
+    )
+
+
+def wait_for_network(timeout: int = 120) -> bool:
+    import urllib.request
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen("https://chatgpt.com", timeout=5)
+            batch_log("Network connectivity restored.")
+            return True
+        except Exception:
+            time.sleep(3)
+    batch_log("Network still unavailable after waiting.")
+    return False
+
+
 def driver_is_alive(driver) -> bool:
     if driver is None:
         return False
@@ -120,6 +152,7 @@ def recover_from_chat_error(
 
 def recreate_driver(model: str | None, *, skip_warmup: bool = False):
     batch_log("Detected dead or disconnected browser session. Recreating driver...")
+    wait_for_network(timeout=90)
     quit_driver(None)
     if os.environ.get("CHATGPT_SYNC_PROFILE_FROM", "").strip():
         sync_profile_from_main()
@@ -396,6 +429,9 @@ def run_with_retries(
                 driver = recreate_driver(model, skip_warmup=skip_warmup)
         except Exception as exc:
             batch_log(f"ERROR on attempt {attempt}/{max_attempts} for {label}: {exc}")
+            if is_network_error(exc):
+                batch_log("Network error detected — waiting for connectivity before retry...")
+                wait_for_network(timeout=120)
             if is_browser_crash_error(exc) or not driver_is_alive(driver):
                 batch_log("Browser crashed or disconnected — recreating session...")
                 quit_driver(driver)

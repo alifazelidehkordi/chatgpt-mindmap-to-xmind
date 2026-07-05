@@ -134,6 +134,17 @@ def score_persian_download_text(text: str) -> int:
     return 0
 
 
+GENERIC_DOWNLOAD_LABELS = frozenset(
+    {
+        "download",
+        "download file",
+        "get file",
+        "save",
+        "save file",
+    }
+)
+
+
 def is_artifact_download_trigger(
     *,
     text: str = "",
@@ -156,10 +167,16 @@ def is_artifact_download_trigger(
     if "/download" in href_lower or "/file-" in href_lower:
         return True
 
-    direct_lower = direct.lower()
+    direct_lower = direct.lower().strip()
+    if direct_lower in GENERIC_DOWNLOAD_LABELS:
+        return True
+    if re.fullmatch(r"download(\s+the)?(\s+opml)?(\s+file)?", direct_lower):
+        return True
+    if any(ext in direct_lower for ext in ARTIFACT_EXTENSIONS):
+        return True
     if "download" in direct_lower and any(
         token in direct_lower
-        for token in (".opml", ".md", ".tex", "markdown", "opml", "mind map", "notes")
+        for token in (".opml", ".md", ".tex", "markdown", "opml", "mind map", "notes", "file")
     ):
         return True
     return False
@@ -463,10 +480,58 @@ async def _wait_until_logged_in(page: Page, timeout: int = 600, headless: bool =
     raise TimeoutError("Timed out waiting for ChatGPT login.")
 
 
+def is_network_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "internet_disconnected",
+            "net::err",
+            "network",
+            "enotfound",
+            "econnrefused",
+            "offline",
+            "name not resolved",
+        )
+    )
+
+
+async def _wait_for_network(timeout: int = 120) -> bool:
+    import urllib.request
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen("https://chatgpt.com", timeout=5)
+            return True
+        except Exception:
+            await asyncio.sleep(3)
+    return False
+
+
+async def _goto_with_retry(page: Page, url: str, *, attempts: int = 4) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            return
+        except Exception as exc:
+            last_error = exc
+            if is_network_error(exc) and attempt < attempts:
+                log(f"Network error loading page (attempt {attempt}/{attempts}): {exc}")
+                if await _wait_for_network(timeout=45):
+                    log("Network restored — retrying navigation.")
+                await asyncio.sleep(2 * attempt)
+                continue
+            raise
+    if last_error:
+        raise last_error
+
+
 async def _start_new_chat(page: Page) -> None:
     log("Starting a new temporary chat.")
     for attempt in range(1, 4):
-        await page.goto(CHATGPT_URL)
+        await _goto_with_retry(page, CHATGPT_URL)
         try:
             await _wait_for_editor(page, timeout=60)
             return
@@ -550,6 +615,8 @@ async def _wait_until_idle(
     generating_since: float | None = None
     last_text = ""
     saw_required_response = min_assistant_count is None
+    extended_for_generation = False
+    last_progress_log = 0.0
 
     while time.time() < deadline:
         if await _dismiss_rate_limit_modal(page):
@@ -571,6 +638,18 @@ async def _wait_until_idle(
 
         if is_generating:
             generating_since = generating_since or time.time()
+            if time.time() - last_progress_log > 60:
+                elapsed = int(time.time() - generating_since)
+                log(f"Still generating ({elapsed}s)...")
+                last_progress_log = time.time()
+            if (
+                not extended_for_generation
+                and time.time() >= deadline - 5
+            ):
+                extension = min(300, LONG_GENERATION_STOP_SECONDS)
+                deadline += extension
+                extended_for_generation = True
+                log(f"Response still generating — extending wait by {extension}s.")
             if (
                 saw_required_response
                 and generating_since
@@ -598,7 +677,9 @@ async def _wait_until_idle(
         body_text = await page.locator("body").inner_text()
         if saw_required_response and body_text == last_text and not is_generating:
             stable_since = stable_since or time.time()
-            if time.time() - stable_since >= 8:
+            if time.time() - stable_since >= 5:
+                if await _wait_for_assistant_download_link(page, timeout=2) is not None:
+                    return
                 return
         else:
             stable_since = None
@@ -676,6 +757,9 @@ async def _wait_for_assistant_download_link(page: Page, timeout: int = 45):
                 text, href, title, aria = await _element_fields(element)
                 label = text or aria or title or ""
                 score = score_persian_download_text(label)
+                label_lower = label.lower().strip()
+                if label_lower in GENERIC_DOWNLOAD_LABELS:
+                    score = max(score, 35)
                 if score == 0 and is_artifact_download_trigger(text=text, href=href, title=title, aria=aria):
                     score = 40
                 if score > 0:
@@ -807,6 +891,32 @@ def latest_assistant_text(driver: PlaywrightDriver) -> str:
     return _run(_latest_assistant_text(driver.page))
 
 
+async def _click_sandbox_links(page: Page, before: set[Path]) -> Path | None:
+    assistant = page.locator("[data-message-author-role='assistant']").last
+    if await assistant.count() == 0:
+        return None
+    links = assistant.locator("a[href*='sandbox:']")
+    count = await links.count()
+    for index in range(count - 1, -1, -1):
+        link = links.nth(index)
+        try:
+            if not await link.is_visible():
+                continue
+            href = await link.get_attribute("href") or ""
+            if not href.startswith("sandbox:"):
+                continue
+            log(f"Clicking sandbox link: {href[:120]}")
+            await link.scroll_into_view_if_needed()
+            await link.click()
+            downloaded = wait_for_download_settled(before, timeout=30)
+            if downloaded:
+                log(f"Download detected via sandbox link: {downloaded.name}")
+                return downloaded
+        except Exception:
+            continue
+    return None
+
+
 def resolve_download(
     driver: PlaywrightDriver | None,
     before: set[Path],
@@ -816,11 +926,15 @@ def resolve_download(
 ) -> Path | None:
     downloaded = None
     if click and driver is not None:
-        downloaded = _run(_click_new_download_link(driver.page, before))
-        if downloaded is None:
-            log("First download click pass missed; retrying download element scan...")
-            time.sleep(2)
+        for pass_index in range(3):
             downloaded = _run(_click_new_download_link(driver.page, before))
+            if downloaded:
+                break
+            if pass_index == 0:
+                log("First download click pass missed; retrying download element scan...")
+            time.sleep(2 + pass_index)
+        if downloaded is None:
+            downloaded = _run(_click_sandbox_links(driver.page, before))
     if downloaded is None:
         downloaded = wait_and_salvage_download(before, timeout=timeout)
     if downloaded is None:

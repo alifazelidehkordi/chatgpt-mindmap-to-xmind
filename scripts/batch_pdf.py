@@ -76,8 +76,11 @@ def process_one(
     downloaded = core.resolve_download(driver, before_downloads, timeout=download_timeout)
     if downloaded is None:
         common.batch_log("Retrying download click after link render wait...")
-        time.sleep(5)
-        downloaded = core.resolve_download(driver, before_downloads, timeout=download_timeout)
+        for wait_seconds in (5, 10):
+            time.sleep(wait_seconds)
+            downloaded = core.resolve_download(driver, before_downloads, timeout=download_timeout)
+            if downloaded:
+                break
 
     if downloaded is None:
         response_text = core.latest_assistant_text(driver)

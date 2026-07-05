@@ -20,6 +20,12 @@ class DownloadDetectionTests(unittest.TestCase):
         self.assertTrue(core.is_opml_download_trigger(href="sandbox:/mnt/data/topic.opml"))
         self.assertTrue(core.is_opml_download_trigger(href="https://example.test/topic.opml"))
 
+    def test_accepts_generic_download_labels(self):
+        self.assertTrue(core.is_opml_download_trigger(text="Download"))
+        self.assertTrue(core.is_opml_download_trigger(text="Download file"))
+        self.assertTrue(core.is_opml_download_trigger(text="Download OPML"))
+        self.assertFalse(core.is_opml_download_trigger(text="Download apps"))
+
     def test_detects_opml_file_by_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "download"
