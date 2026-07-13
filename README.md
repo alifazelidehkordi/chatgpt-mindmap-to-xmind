@@ -2,7 +2,7 @@
 
 The canonical end-to-end automation pipeline for turning study materials into **XMind mind maps** (`.xmind`) through the ChatGPT web UI.
 
-> Repository consolidation: this project is the successor formerly named `chatgpt-mindmap-to-xmind-v3`. It supersedes `chatgpt-mindmap-to-xmind`, `chatgpt-mindmap-to-xmind-v2`, `chatgpt-mindmap-pipeline`, and `chatgpt-mindmap-automation`.
+> Repository consolidation: this is the canonical project. It supersedes the archived `chatgpt-mindmap-to-xmind-legacy`, `chatgpt-mindmap-to-xmind-v2`, `chatgpt-mindmap-pipeline`, and `chatgpt-mindmap-automation` repositories.
 
 ```
 PDF / DOCX / Markdown / TeX  →  ChatGPT (OPML)  →  XMind (.xmind)
